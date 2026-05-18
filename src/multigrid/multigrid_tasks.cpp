@@ -34,13 +34,13 @@ void MultigridDriver::DoTaskListOneStage() {
 
 TaskStatus MultigridDriver::ClearRecv(Driver *pdrive, int stage) {
   TaskStatus tstat;
-  tstat = pmg->pbval->ClearRecv();
+  tstat = pmg->pbval->ClearRecvMG();
   return tstat;
 }
 
 TaskStatus MultigridDriver::ClearSend(Driver *pdrive, int stage) {
   TaskStatus tstat;
-  tstat = pmg->pbval->ClearSend();
+  tstat = pmg->pbval->ClearSendMG();
   return tstat;
 }
 

@@ -609,6 +609,8 @@ class MultigridBoundaryValues : public MeshBoundaryValuesCC {
   TaskStatus PackAndSendMG(const DvceArray5D<Real> &u);
   TaskStatus RecvAndUnpackMG(DvceArray5D<Real> &u);
   TaskStatus InitRecvMG(const int nvars);
+  TaskStatus ClearSendMG();
+  TaskStatus ClearRecvMG();
   TaskStatus FillFineCoarseMGGhosts(DvceArray5D<Real> &u);
 
   // New FC communication via pack/send/recv/unpack infrastructure
@@ -622,6 +624,30 @@ class MultigridBoundaryValues : public MeshBoundaryValuesCC {
 
  private:
   Multigrid *pmy_mg;
+  bool use_rank_packed_mg_bvals_ = false;
+  bool show_rank_packed_mg_bvals_stats_ = false;
+  std::vector<RankPackedVarEntry> mg_send_var_entries_;
+  std::vector<RankPackedVarEntry> mg_recv_var_entries_;
+  std::vector<RankPackedVarMessage> mg_send_var_msgs_;
+  std::vector<RankPackedVarMessage> mg_recv_var_msgs_;
+#if MPI_PARALLEL_ENABLED
+  std::vector<MPI_Request> mg_send_var_reqs_;
+  std::vector<MPI_Request> mg_recv_var_reqs_;
+  std::vector<MPI_Request> mg_send_var_hdr_reqs_;
+  std::vector<MPI_Request> mg_recv_var_hdr_reqs_;
+#endif
+  DvceArray1D<Real> mg_rank_sendbuf_vars_;
+  DvceArray1D<Real> mg_rank_recvbuf_vars_;
+  DvceArray1D<int> mg_rank_sendhdr_vars_;
+  DvceArray1D<int> mg_rank_recvhdr_vars_;
+  int mg_rankpack_level_cache_ = -1;
+  int mg_rankpack_nvars_cache_ = -1;
+  bool mg_rankpack_skipfc_cache_ = false;
+  int mg_rankpack_mesh_seq_cache_ = -1;
+
+#if MPI_PARALLEL_ENABLED
+  void BuildRankPackedMGMetadata(const int nvars, const int lev, const bool skip_fc);
+#endif
 };
 
 inline Real RestrictOne(const MGOctet &oct, int v, int fi, int fj, int fk) {

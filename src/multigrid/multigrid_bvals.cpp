@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -33,7 +34,131 @@ MultigridBoundaryValues::MultigridBoundaryValues(
     MeshBlockPack *pmbp, ParameterInput *pin,
     bool coarse, Multigrid *pmg)
   : MeshBoundaryValuesCC(pmbp, pin, coarse), pmy_mg(pmg) {
+  // Keep MG transport switch independent from hydro's always-on rank-packed vars path.
+  use_rank_packed_mg_bvals_ =
+      pin->GetOrAddBoolean("gravity", "use_rank_packed_mg_bvals", false);
+  show_rank_packed_mg_bvals_stats_ =
+      pin->GetOrAddBoolean("gravity", "show_rank_packed_mg_bvals_stats", false);
 }
+
+#if MPI_PARALLEL_ENABLED
+void MultigridBoundaryValues::BuildRankPackedMGMetadata(const int nvars, const int lev,
+                                                        const bool skip_fc) {
+  int nmb = pmy_pack->nmb_thispack;
+  int nnghbr = pmy_pack->pmb->nnghbr;
+  int my_rank = global_variable::my_rank;
+  auto &nghbr = pmy_pack->pmb->nghbr;
+  auto &mblev = pmy_pack->pmb->mb_lev;
+
+  mg_send_var_entries_.clear();
+  mg_recv_var_entries_.clear();
+  mg_send_var_msgs_.clear();
+  mg_recv_var_msgs_.clear();
+  mg_send_var_reqs_.clear();
+  mg_recv_var_reqs_.clear();
+  mg_send_var_hdr_reqs_.clear();
+  mg_recv_var_hdr_reqs_.clear();
+
+  std::map<int, std::vector<RankPackedVarEntry>> send_by_rank;
+  std::map<int, std::vector<RankPackedVarEntry>> recv_by_rank;
+
+  for (int m = 0; m < nmb; ++m) {
+    for (int n = 0; n < nnghbr; ++n) {
+      if (nghbr.h_view(m, n).gid < 0) continue;
+      int nlev = nghbr.h_view(m, n).lev;
+      int mlev = mblev.h_view(m);
+      bool is_fc = (nlev != mlev);
+      if (is_fc && skip_fc) continue;
+      int drank = nghbr.h_view(m, n).rank;
+      if (drank == my_rank) continue;
+      int lid = nghbr.h_view(m, n).gid - pmy_pack->pmesh->gids_eachrank[drank];
+      int dn = nghbr.h_view(m, n).dest;
+
+      int send_size = 0;
+      int recv_size = 0;
+      if (nlev < mlev) {
+        send_size = nvars * send_mg_indcs_[n][lev].icoar_ndat;
+        recv_size = nvars * recv_mg_indcs_[n][lev].icoar_ndat;
+      } else if (nlev == mlev) {
+        send_size = nvars * send_mg_indcs_[n][lev].isame_ndat;
+        recv_size = nvars * recv_mg_indcs_[n][lev].isame_ndat;
+      } else {
+        send_size = nvars * send_mg_indcs_[n][lev].ifine_ndat;
+        recv_size = nvars * recv_mg_indcs_[n][lev].ifine_ndat;
+      }
+
+      if (send_size > 0) {
+        send_by_rank[drank].push_back({m, n, lid, dn, send_size, 0});
+      }
+      if (recv_size > 0) {
+        recv_by_rank[drank].push_back({m, n, 0, 0, recv_size, 0});
+      }
+    }
+  }
+
+  int send_data_off = 0;
+  int send_entry_off = 0;
+  int send_hdr_off = 0;
+  for (auto &kv : send_by_rank) {
+    RankPackedVarMessage msg;
+    msg.rank = kv.first;
+    msg.nentries = static_cast<int>(kv.second.size());
+    msg.entry_offset = send_entry_off;
+    msg.hdr_offset = send_hdr_off;
+    msg.offset = send_data_off;
+    msg.data_size = 0;
+    for (auto &e : kv.second) {
+      e.offset = send_data_off;
+      msg.data_size += e.data_size;
+      send_data_off += e.data_size;
+      mg_send_var_entries_.push_back(e);
+      ++send_entry_off;
+    }
+    send_hdr_off += 3 * msg.nentries;
+    mg_send_var_msgs_.push_back(msg);
+  }
+
+  int recv_data_off = 0;
+  int recv_entry_off = 0;
+  int recv_hdr_off = 0;
+  for (auto &kv : recv_by_rank) {
+    RankPackedVarMessage msg;
+    msg.rank = kv.first;
+    msg.nentries = static_cast<int>(kv.second.size());
+    msg.entry_offset = recv_entry_off;
+    msg.hdr_offset = recv_hdr_off;
+    msg.offset = recv_data_off;
+    msg.data_size = 0;
+    for (auto &e : kv.second) {
+      e.offset = recv_data_off;
+      msg.data_size += e.data_size;
+      recv_data_off += e.data_size;
+      mg_recv_var_entries_.push_back(e);
+      ++recv_entry_off;
+    }
+    recv_hdr_off += 3 * msg.nentries;
+    mg_recv_var_msgs_.push_back(msg);
+  }
+
+  mg_rank_sendbuf_vars_ = DvceArray1D<Real>("rank_sendbuf_mg", send_data_off);
+  mg_rank_recvbuf_vars_ = DvceArray1D<Real>("rank_recvbuf_mg", recv_data_off);
+  mg_rank_sendhdr_vars_ = DvceArray1D<int>("rank_sendhdr_mg", send_hdr_off);
+  mg_rank_recvhdr_vars_ = DvceArray1D<int>("rank_recvhdr_mg", recv_hdr_off);
+  mg_send_var_reqs_.assign(mg_send_var_msgs_.size(), MPI_REQUEST_NULL);
+  mg_recv_var_reqs_.assign(mg_recv_var_msgs_.size(), MPI_REQUEST_NULL);
+  mg_send_var_hdr_reqs_.assign(mg_send_var_msgs_.size(), MPI_REQUEST_NULL);
+  mg_recv_var_hdr_reqs_.assign(mg_recv_var_msgs_.size(), MPI_REQUEST_NULL);
+
+  if (show_rank_packed_mg_bvals_stats_ && global_variable::my_rank == 0) {
+    std::cout << "[MG rankpack] level=" << lev
+              << " send_msgs=" << mg_send_var_msgs_.size()
+              << " recv_msgs=" << mg_recv_var_msgs_.size()
+              << " send_entries=" << mg_send_var_entries_.size()
+              << " recv_entries=" << mg_recv_var_entries_.size() << std::endl;
+  }
+}
+#endif
+
 
 //----------------------------------------------------------------------------------------
 //! \fn void MultigridBoundaryValues::RemapIndicesForMG()
@@ -2024,15 +2149,22 @@ TaskStatus MultigridBoundaryValues::PackAndSendMG(const DvceArray5D<Real> &u) {
   auto cbuf = coarse_buf_;
 
 #if MPI_PARALLEL_ENABLED
-  for (int m=0; m<nmb; ++m) {
-    for (int n=0; n<nnghbr; ++n) {
-      if (nghbr.h_view(m,n).gid >= 0
-          && nghbr.h_view(m,n).rank != my_rank) {
-        int nlev_h = nghbr.h_view(m,n).lev;
-        int mlev_h = mblev.h_view(m);
-        bool is_fc = (nlev_h != mlev_h);
-        if (is_fc && skip_fc_this_level) continue;
-        MPI_Wait(&(sendbuf[n].vars_req[m]), MPI_STATUS_IGNORE);
+  if (use_rank_packed_mg_bvals_) {
+    for (std::size_t i = 0; i < mg_send_var_msgs_.size(); ++i) {
+      MPI_Wait(&mg_send_var_hdr_reqs_[i], MPI_STATUS_IGNORE);
+      MPI_Wait(&mg_send_var_reqs_[i], MPI_STATUS_IGNORE);
+    }
+  } else {
+    for (int m=0; m<nmb; ++m) {
+      for (int n=0; n<nnghbr; ++n) {
+        if (nghbr.h_view(m,n).gid >= 0
+            && nghbr.h_view(m,n).rank != my_rank) {
+          int nlev_h = nghbr.h_view(m,n).lev;
+          int mlev_h = mblev.h_view(m);
+          bool is_fc = (nlev_h != mlev_h);
+          if (is_fc && skip_fc_this_level) continue;
+          MPI_Wait(&(sendbuf[n].vars_req[m]), MPI_STATUS_IGNORE);
+        }
       }
     }
   }
@@ -2149,42 +2281,77 @@ TaskStatus MultigridBoundaryValues::PackAndSendMG(const DvceArray5D<Real> &u) {
   }
   if (has_cross_rank) Kokkos::fence();
 
-  bool no_errors=true;
-  for (int m=0; m<nmb; ++m) {
-    for (int n=0; n<nnghbr; ++n) {
-      if (nghbr.h_view(m,n).gid < 0) continue;
-      int nlev = nghbr.h_view(m,n).lev;
-      int mlev = pmy_pack->pmb->mb_lev.h_view(m);
-      bool is_fc_mpi = (nlev != mlev);
-      if (is_fc_mpi && skip_fc_this_level) continue;
-      {
-        int dn = nghbr.h_view(m,n).dest;
-        int drank = nghbr.h_view(m,n).rank;
-        if (drank != my_rank) {
-          // create tag using local ID and buffer index of *receiving* MeshBlock
-          int lid = nghbr.h_view(m,n).gid - pmy_pack->pmesh->gids_eachrank[drank];
-          int tag = CreateBvals_MPI_Tag(lid, dn);
+  bool no_errors = true;
+  if (use_rank_packed_mg_bvals_) {
+    for (const auto &entry : mg_send_var_entries_) {
+      auto src = Kokkos::subview(sendbuf[entry.n].vars, entry.m, Kokkos::make_pair(0, entry.data_size));
+      auto dst = Kokkos::subview(mg_rank_sendbuf_vars_, Kokkos::make_pair(entry.offset,
+                                entry.offset + entry.data_size));
+      Kokkos::deep_copy(dst, src);
+    }
+    auto send_hdr_h = Kokkos::create_mirror_view(mg_rank_sendhdr_vars_);
+    for (const auto &msg : mg_send_var_msgs_) {
+      for (int e = 0; e < msg.nentries; ++e) {
+        const auto &entry = mg_send_var_entries_[msg.entry_offset + e];
+        const int hdr_i = msg.hdr_offset + 3 * e;
+        send_hdr_h(hdr_i + 0) = entry.lid;
+        send_hdr_h(hdr_i + 1) = entry.dn;
+        send_hdr_h(hdr_i + 2) = entry.data_size;
+      }
+    }
+    Kokkos::deep_copy(mg_rank_sendhdr_vars_, send_hdr_h);
+    Kokkos::fence();
 
-          int data_size;
-          if (nlev < mlev) {
-            data_size = nvar * send_mg_indcs_[n][lev_].icoar_ndat;
-          } else if (nlev == mlev) {
-            data_size = nvar * send_mg_indcs_[n][lev_].isame_ndat;
-          } else {
-            data_size = nvar * send_mg_indcs_[n][lev_].ifine_ndat;
+    for (std::size_t i = 0; i < mg_send_var_msgs_.size(); ++i) {
+      const auto &msg = mg_send_var_msgs_[i];
+      int ierr_h = MPI_Isend(mg_rank_sendhdr_vars_.data() + msg.hdr_offset, 3 * msg.nentries,
+                             MPI_INT, msg.rank, 96, comm_vars, &mg_send_var_hdr_reqs_[i]);
+      int ierr_d = MPI_Isend(mg_rank_sendbuf_vars_.data() + msg.offset, msg.data_size,
+                             MPI_ATHENA_REAL, msg.rank, 97, comm_vars, &mg_send_var_reqs_[i]);
+      if (ierr_h != MPI_SUCCESS || ierr_d != MPI_SUCCESS) {
+        no_errors = false;
+      } else {
+        pmy_mg->pmy_driver_->mg_timers_.msg_count += 2;
+        pmy_mg->pmy_driver_->mg_timers_.bytes_sent +=
+            (msg.data_size * static_cast<int64_t>(sizeof(Real))
+             + 3LL * msg.nentries * static_cast<int64_t>(sizeof(int)));
+      }
+    }
+  } else {
+    for (int m=0; m<nmb; ++m) {
+      for (int n=0; n<nnghbr; ++n) {
+        if (nghbr.h_view(m,n).gid < 0) continue;
+        int nlev = nghbr.h_view(m,n).lev;
+        int mlev = pmy_pack->pmb->mb_lev.h_view(m);
+        bool is_fc_mpi = (nlev != mlev);
+        if (is_fc_mpi && skip_fc_this_level) continue;
+        {
+          int dn = nghbr.h_view(m,n).dest;
+          int drank = nghbr.h_view(m,n).rank;
+          if (drank != my_rank) {
+            // create tag using local ID and buffer index of *receiving* MeshBlock
+            int lid = nghbr.h_view(m,n).gid - pmy_pack->pmesh->gids_eachrank[drank];
+            int tag = CreateBvals_MPI_Tag(lid, dn);
+
+            int data_size;
+            if (nlev < mlev) {
+              data_size = nvar * send_mg_indcs_[n][lev_].icoar_ndat;
+            } else if (nlev == mlev) {
+              data_size = nvar * send_mg_indcs_[n][lev_].isame_ndat;
+            } else {
+              data_size = nvar * send_mg_indcs_[n][lev_].ifine_ndat;
+            }
+
+            MPI_Wait(&(sendbuf[n].vars_req[m]), MPI_STATUS_IGNORE);
+
+            auto send_ptr = Kokkos::subview(sendbuf[n].vars, m, Kokkos::ALL);
+            int ierr = MPI_Isend(send_ptr.data(), data_size, MPI_ATHENA_REAL, drank, tag,
+                                 comm_vars, &(sendbuf[n].vars_req[m]));
+            if (ierr != MPI_SUCCESS) {no_errors=false;}
+            pmy_mg->pmy_driver_->mg_timers_.msg_count++;
+            pmy_mg->pmy_driver_->mg_timers_.bytes_sent +=
+                data_size * static_cast<int64_t>(sizeof(Real));
           }
-
-          MPI_Wait(&(sendbuf[n].vars_req[m]), MPI_STATUS_IGNORE);
-
-          auto send_ptr = Kokkos::subview(sendbuf[n].vars, m, Kokkos::ALL);
-          int ierr = MPI_Isend(send_ptr.data(), data_size, MPI_ATHENA_REAL, drank, tag,
-                               comm_vars, &(sendbuf[n].vars_req[m]));
-          if (ierr != MPI_SUCCESS) {
-            no_errors = false;
-          }
-          pmy_mg->pmy_driver_->mg_timers_.msg_count++;
-          pmy_mg->pmy_driver_->mg_timers_.bytes_sent +=
-              data_size * static_cast<int64_t>(sizeof(Real));
         }
       }
     }
@@ -2219,25 +2386,42 @@ TaskStatus MultigridBoundaryValues::RecvAndUnpackMG(DvceArray5D<Real> &u) {
   #if MPI_PARALLEL_ENABLED
   //----- STEP 1: check that recv boundary buffer communications have all completed
   bool bflag = false;
-  for (int m=0; m<nmb; ++m) {
-    for (int n=0; n<nnghbr; ++n) {
-      if (nghbr.h_view(m,n).gid >= 0
-          && nghbr.h_view(m,n).rank != global_variable::my_rank) {
-        int nlev_h = nghbr.h_view(m,n).lev;
-        int mlev_h = mblev.h_view(m);
-        bool is_fc_h = (nlev_h != mlev_h);
-        if (is_fc_h && skip_fc_this_level) continue;
-        {
-          int test;
-          int ierr = MPI_Test(&(rbuf[n].vars_req[m]), &test, MPI_STATUS_IGNORE);
-          if (ierr != MPI_SUCCESS) {
-            std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                      << std::endl << "MPI error in testing non-blocking receives"
-                      << std::endl;
-            std::exit(EXIT_FAILURE);
-          }
-          if (!static_cast<bool>(test)) {
-            bflag = true;
+  if (use_rank_packed_mg_bvals_) {
+    for (std::size_t i = 0; i < mg_recv_var_msgs_.size(); ++i) {
+      int test_h = 0;
+      int test_d = 0;
+      int ierr_h = MPI_Test(&mg_recv_var_hdr_reqs_[i], &test_h, MPI_STATUS_IGNORE);
+      int ierr_d = MPI_Test(&mg_recv_var_reqs_[i], &test_d, MPI_STATUS_IGNORE);
+      if (ierr_h != MPI_SUCCESS || ierr_d != MPI_SUCCESS) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "MPI error in testing rank-packed MG receives"
+                  << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      if (!(static_cast<bool>(test_h) && static_cast<bool>(test_d))) {
+        bflag = true;
+      }
+    }
+  } else {
+    for (int m=0; m<nmb; ++m) {
+      for (int n=0; n<nnghbr; ++n) {
+        if (nghbr.h_view(m,n).gid >= 0 && nghbr.h_view(m,n).rank != global_variable::my_rank) {
+          int nlev_h = nghbr.h_view(m,n).lev;
+          int mlev_h = mblev.h_view(m);
+          bool is_fc_h = (nlev_h != mlev_h);
+          if (is_fc_h && skip_fc_this_level) continue;
+          {
+            int test;
+            int ierr = MPI_Test(&(rbuf[n].vars_req[m]), &test, MPI_STATUS_IGNORE);
+            if (ierr != MPI_SUCCESS) {
+              std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                        << std::endl << "MPI error in testing non-blocking receives"
+                        << std::endl;
+              std::exit(EXIT_FAILURE);
+            }
+            if (!static_cast<bool>(test)) {
+              bflag = true;
+            }
           }
         }
       }
@@ -2245,6 +2429,45 @@ TaskStatus MultigridBoundaryValues::RecvAndUnpackMG(DvceArray5D<Real> &u) {
   }
   if (bflag) {
     return TaskStatus::incomplete;
+  }
+#endif
+
+#if MPI_PARALLEL_ENABLED
+  if (use_rank_packed_mg_bvals_) {
+    auto recv_hdr_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), mg_rank_recvhdr_vars_);
+    for (const auto &msg : mg_recv_var_msgs_) {
+      int off = msg.offset;
+      for (int e = 0; e < msg.nentries; ++e) {
+        const int hdr_i = msg.hdr_offset + 3 * e;
+        int lid = recv_hdr_h(hdr_i + 0);
+        int dn = recv_hdr_h(hdr_i + 1);
+        int dsize = recv_hdr_h(hdr_i + 2);
+        if (lid < 0 || lid >= nmb || dn < 0 || dn >= nnghbr) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "Invalid rank-packed MG recv header metadata"
+                    << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        if (dsize <= 0 || (off + dsize) > (msg.offset + msg.data_size)) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "Rank-packed MG recv payload size mismatch"
+                    << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        auto src = Kokkos::subview(mg_rank_recvbuf_vars_,
+                                   Kokkos::make_pair(off, off + dsize));
+        auto dst = Kokkos::subview(recvbuf[dn].vars, lid, Kokkos::make_pair(0, dsize));
+        Kokkos::deep_copy(dst, src);
+        off += dsize;
+      }
+      if (off != (msg.offset + msg.data_size)) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "Rank-packed MG recv payload accounting mismatch"
+                  << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+    }
+    Kokkos::fence();
   }
 #endif
 
@@ -2346,6 +2569,36 @@ TaskStatus MultigridBoundaryValues::InitRecvMG(const int nvars) {
   int shift_ir = pmy_mg->GetNumberOfLevels() - 1 - lev_;
   int ncells_ir = pmy_mg->GetSize() >> shift_ir;
   bool skip_fc_ir = (ncells_ir < 2);
+  const int mesh_seq = pmy_pack->pmesh->GetAMRLoadBalanceUpdateSeq();
+
+  if (use_rank_packed_mg_bvals_) {
+    if (mg_rankpack_nvars_cache_ != nvars || mg_rankpack_level_cache_ != lev_
+        || mg_rankpack_skipfc_cache_ != skip_fc_ir
+        || mg_rankpack_mesh_seq_cache_ != mesh_seq) {
+      BuildRankPackedMGMetadata(nvars, lev_, skip_fc_ir);
+      mg_rankpack_nvars_cache_ = nvars;
+      mg_rankpack_level_cache_ = lev_;
+      mg_rankpack_skipfc_cache_ = skip_fc_ir;
+      mg_rankpack_mesh_seq_cache_ = mesh_seq;
+    }
+
+    for (std::size_t i = 0; i < mg_recv_var_msgs_.size(); ++i) {
+      auto &msg = mg_recv_var_msgs_[i];
+      MPI_Wait(&mg_recv_var_hdr_reqs_[i], MPI_STATUS_IGNORE);
+      MPI_Wait(&mg_recv_var_reqs_[i], MPI_STATUS_IGNORE);
+
+      int ierr_h = MPI_Irecv(mg_rank_recvhdr_vars_.data() + msg.hdr_offset, 3 * msg.nentries,
+                             MPI_INT, msg.rank, 96, comm_vars, &mg_recv_var_hdr_reqs_[i]);
+      int ierr_d = MPI_Irecv(mg_rank_recvbuf_vars_.data() + msg.offset, msg.data_size,
+                             MPI_ATHENA_REAL, msg.rank, 97, comm_vars, &mg_recv_var_reqs_[i]);
+      if (ierr_h != MPI_SUCCESS || ierr_d != MPI_SUCCESS) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+           << std::endl << "MPI error in posting rank-packed MG receives" << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+    }
+    return TaskStatus::complete;
+  }
 
   // Initialize communications of variables
   bool no_errors=true;
@@ -2394,4 +2647,39 @@ TaskStatus MultigridBoundaryValues::InitRecvMG(const int nvars) {
   }
 #endif
   return TaskStatus::complete;
+}
+
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus MultigridBoundaryValues::ClearRecvMG()
+//! \brief Rank-packed-aware clear for MG sends/recvs.
+
+TaskStatus MultigridBoundaryValues::ClearRecvMG() {
+#if MPI_PARALLEL_ENABLED
+  if (use_rank_packed_mg_bvals_) {
+    for (std::size_t i = 0; i < mg_recv_var_reqs_.size(); ++i) {
+      MPI_Wait(&mg_recv_var_hdr_reqs_[i], MPI_STATUS_IGNORE);
+      MPI_Wait(&mg_recv_var_reqs_[i], MPI_STATUS_IGNORE);
+    }
+    return TaskStatus::complete;
+  }
+#endif
+  return ClearRecv();
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus MultigridBoundaryValues::ClearSendMG()
+//! \brief Rank-packed-aware clear for MG sends/recvs.
+
+TaskStatus MultigridBoundaryValues::ClearSendMG() {
+#if MPI_PARALLEL_ENABLED
+  if (use_rank_packed_mg_bvals_) {
+    for (std::size_t i = 0; i < mg_send_var_reqs_.size(); ++i) {
+      MPI_Wait(&mg_send_var_hdr_reqs_[i], MPI_STATUS_IGNORE);
+      MPI_Wait(&mg_send_var_reqs_[i], MPI_STATUS_IGNORE);
+    }
+    return TaskStatus::complete;
+  }
+#endif
+  return ClearSend();
 }

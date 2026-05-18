@@ -181,8 +181,7 @@ void MultigridDriver::SubtractAverage(MGVariable type) {
 void MultigridDriver::PrepareForAMR() {
   locrootlevel_ = pmy_mesh_->root_level;
 
-  // Detect if mesh has changed (AMR or load balancing).
-  // Athena++ uses pmy_mesh_->amr_updated; AthenaK tracks cumulative AMR events instead.
+  // Detect if mesh has changed (AMR and resulting load balancing).
   int new_nbtotal = pmy_mesh_->nmb_total;
   if (new_nbtotal != nbtotal_) {
     nbtotal_ = new_nbtotal;
@@ -193,12 +192,8 @@ void MultigridDriver::PrepareForAMR() {
     needinit_ = true;
   }
 
-  if (pmy_mesh_->pmr != nullptr) {
-    int new_seq = pmy_mesh_->pmr->nmb_created + pmy_mesh_->pmr->nmb_deleted;
-    if (new_seq != amr_seq_) {
-      amr_seq_ = new_seq;
-      needinit_ = true;
-    }
+  if (pmy_mesh_->IsMeshUpdated()) {
+    needinit_ = true;
   }
 
   // Calculate number of refinement levels present in mesh
