@@ -640,6 +640,11 @@ class MultigridBoundaryValues : public MeshBoundaryValuesCC {
   DvceArray1D<Real> mg_rank_recvbuf_vars_;
   DvceArray1D<int> mg_rank_sendhdr_vars_;
   DvceArray1D<int> mg_rank_recvhdr_vars_;
+  // Device-resident mirrors of the entry tables, used by fused pack/unpack kernels
+  // to avoid issuing one Kokkos::deep_copy per entry. Rebuilt alongside the buffer
+  // allocations in BuildRankPackedMGMetadata.
+  DvceArray1D<RankPackedVarEntry> mg_send_var_entries_d_;
+  DvceArray1D<RankPackedVarEntry> mg_recv_var_entries_d_;
   int mg_rankpack_level_cache_ = -1;
   int mg_rankpack_nvars_cache_ = -1;
   bool mg_rankpack_skipfc_cache_ = false;

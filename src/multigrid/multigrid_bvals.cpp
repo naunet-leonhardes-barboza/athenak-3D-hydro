@@ -144,6 +144,22 @@ void MultigridBoundaryValues::BuildRankPackedMGMetadata(const int nvars, const i
   mg_rank_recvbuf_vars_ = DvceArray1D<Real>("rank_recvbuf_mg", recv_data_off);
   mg_rank_sendhdr_vars_ = DvceArray1D<int>("rank_sendhdr_mg", send_hdr_off);
   mg_rank_recvhdr_vars_ = DvceArray1D<int>("rank_recvhdr_mg", recv_hdr_off);
+
+  // Mirror the entry tables to device for the fused pack/unpack kernels.
+  {
+    const std::size_t nsend = mg_send_var_entries_.size();
+    const std::size_t nrecv = mg_recv_var_entries_.size();
+    mg_send_var_entries_d_ =
+        DvceArray1D<RankPackedVarEntry>("mg_send_var_entries_d", nsend);
+    mg_recv_var_entries_d_ =
+        DvceArray1D<RankPackedVarEntry>("mg_recv_var_entries_d", nrecv);
+    auto h_send = Kokkos::create_mirror_view(mg_send_var_entries_d_);
+    auto h_recv = Kokkos::create_mirror_view(mg_recv_var_entries_d_);
+    for (std::size_t i = 0; i < nsend; ++i) h_send(i) = mg_send_var_entries_[i];
+    for (std::size_t i = 0; i < nrecv; ++i) h_recv(i) = mg_recv_var_entries_[i];
+    Kokkos::deep_copy(mg_send_var_entries_d_, h_send);
+    Kokkos::deep_copy(mg_recv_var_entries_d_, h_recv);
+  }
   mg_send_var_reqs_.assign(mg_send_var_msgs_.size(), MPI_REQUEST_NULL);
   mg_recv_var_reqs_.assign(mg_recv_var_msgs_.size(), MPI_REQUEST_NULL);
   mg_send_var_hdr_reqs_.assign(mg_send_var_msgs_.size(), MPI_REQUEST_NULL);
@@ -2283,11 +2299,24 @@ TaskStatus MultigridBoundaryValues::PackAndSendMG(const DvceArray5D<Real> &u) {
 
   bool no_errors = true;
   if (use_rank_packed_mg_bvals_) {
-    for (const auto &entry : mg_send_var_entries_) {
-      auto src = Kokkos::subview(sendbuf[entry.n].vars, entry.m, Kokkos::make_pair(0, entry.data_size));
-      auto dst = Kokkos::subview(mg_rank_sendbuf_vars_, Kokkos::make_pair(entry.offset,
-                                entry.offset + entry.data_size));
-      Kokkos::deep_copy(dst, src);
+    // Fused device-side aggregate: one TeamPolicy kernel copies every entry from
+    // its per-neighbour pack buffer into the rank-packed aggregate buffer. Replaces
+    // an O(n_entries) sequence of Kokkos::deep_copy calls (each a separate kernel
+    // launch) with a single launch, which is the dominant cost at high node count.
+    const int n_send_entries = static_cast<int>(mg_send_var_entries_.size());
+    if (n_send_entries > 0) {
+      auto entries = mg_send_var_entries_d_;
+      auto aggbuf = mg_rank_sendbuf_vars_;
+      Kokkos::TeamPolicy<> agg_policy(DevExeSpace(), n_send_entries, Kokkos::AUTO);
+      Kokkos::parallel_for("MGRankPackAgg", agg_policy,
+        KOKKOS_LAMBDA(TeamMember_t tm) {
+          const int e = tm.league_rank();
+          const auto entry = entries(e);
+          Kokkos::parallel_for(Kokkos::TeamVectorRange(tm, entry.data_size),
+            [&](const int k) {
+              aggbuf(entry.offset + k) = sbuf[entry.n].vars(entry.m, k);
+            });
+        });
     }
     auto send_hdr_h = Kokkos::create_mirror_view(mg_rank_sendhdr_vars_);
     for (const auto &msg : mg_send_var_msgs_) {
@@ -2434,40 +2463,71 @@ TaskStatus MultigridBoundaryValues::RecvAndUnpackMG(DvceArray5D<Real> &u) {
 
 #if MPI_PARALLEL_ENABLED
   if (use_rank_packed_mg_bvals_) {
+    // Fused device-side scatter: build a small per-entry task table on host from
+    // the received header, deep_copy it once, then run one parallel_for that
+    // distributes every entry from the rank-packed recv buffer into the
+    // per-neighbour recv buffers. Replaces O(n_entries) Kokkos::deep_copy
+    // launches with a single launch.
     auto recv_hdr_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), mg_rank_recvhdr_vars_);
-    for (const auto &msg : mg_recv_var_msgs_) {
-      int off = msg.offset;
-      for (int e = 0; e < msg.nentries; ++e) {
-        const int hdr_i = msg.hdr_offset + 3 * e;
-        int lid = recv_hdr_h(hdr_i + 0);
-        int dn = recv_hdr_h(hdr_i + 1);
-        int dsize = recv_hdr_h(hdr_i + 2);
-        if (lid < 0 || lid >= nmb || dn < 0 || dn >= nnghbr) {
+    const int n_recv_entries = static_cast<int>(mg_recv_var_entries_.size());
+    if (n_recv_entries > 0) {
+      auto unpack_tasks_d =
+          DvceArray1D<RankPackedVarEntry>("mg_unpack_tasks", n_recv_entries);
+      auto unpack_tasks_h = Kokkos::create_mirror_view(unpack_tasks_d);
+      int t = 0;
+      for (const auto &msg : mg_recv_var_msgs_) {
+        int off = msg.offset;
+        for (int e = 0; e < msg.nentries; ++e) {
+          const int hdr_i = msg.hdr_offset + 3 * e;
+          const int lid = recv_hdr_h(hdr_i + 0);
+          const int dn = recv_hdr_h(hdr_i + 1);
+          const int dsize = recv_hdr_h(hdr_i + 2);
+          if (lid < 0 || lid >= nmb || dn < 0 || dn >= nnghbr) {
+            std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                      << std::endl << "Invalid rank-packed MG recv header metadata"
+                      << std::endl;
+            std::exit(EXIT_FAILURE);
+          }
+          if (dsize <= 0 || (off + dsize) > (msg.offset + msg.data_size)) {
+            std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                      << std::endl << "Rank-packed MG recv payload size mismatch"
+                      << std::endl;
+            std::exit(EXIT_FAILURE);
+          }
+          // Repurpose RankPackedVarEntry's fields: lid/dn for destination,
+          // offset for source-aggregate offset, data_size for payload length.
+          // m/n are unused here.
+          unpack_tasks_h(t).m = 0;
+          unpack_tasks_h(t).n = 0;
+          unpack_tasks_h(t).lid = lid;
+          unpack_tasks_h(t).dn = dn;
+          unpack_tasks_h(t).data_size = dsize;
+          unpack_tasks_h(t).offset = off;
+          ++t;
+          off += dsize;
+        }
+        if (off != (msg.offset + msg.data_size)) {
           std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                    << std::endl << "Invalid rank-packed MG recv header metadata"
+                    << std::endl << "Rank-packed MG recv payload accounting mismatch"
                     << std::endl;
           std::exit(EXIT_FAILURE);
         }
-        if (dsize <= 0 || (off + dsize) > (msg.offset + msg.data_size)) {
-          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                    << std::endl << "Rank-packed MG recv payload size mismatch"
-                    << std::endl;
-          std::exit(EXIT_FAILURE);
-        }
-        auto src = Kokkos::subview(mg_rank_recvbuf_vars_,
-                                   Kokkos::make_pair(off, off + dsize));
-        auto dst = Kokkos::subview(recvbuf[dn].vars, lid, Kokkos::make_pair(0, dsize));
-        Kokkos::deep_copy(dst, src);
-        off += dsize;
       }
-      if (off != (msg.offset + msg.data_size)) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                  << std::endl << "Rank-packed MG recv payload accounting mismatch"
-                  << std::endl;
-        std::exit(EXIT_FAILURE);
-      }
+      Kokkos::deep_copy(unpack_tasks_d, unpack_tasks_h);
+
+      auto aggbuf = mg_rank_recvbuf_vars_;
+      Kokkos::TeamPolicy<> sc_policy(DevExeSpace(), n_recv_entries, Kokkos::AUTO);
+      Kokkos::parallel_for("MGRankUnpackScatter", sc_policy,
+        KOKKOS_LAMBDA(TeamMember_t tm) {
+          const int e = tm.league_rank();
+          const auto task = unpack_tasks_d(e);
+          Kokkos::parallel_for(Kokkos::TeamVectorRange(tm, task.data_size),
+            [&](const int k) {
+              rbuf[task.dn].vars(task.lid, k) = aggbuf(task.offset + k);
+            });
+        });
+      Kokkos::fence();
     }
-    Kokkos::fence();
   }
 #endif
 
