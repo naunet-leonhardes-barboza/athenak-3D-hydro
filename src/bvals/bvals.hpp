@@ -164,6 +164,20 @@ class MeshBoundaryValues {
   std::vector<MPI_Request> send_var_hdr_reqs_, recv_var_hdr_reqs_;
   DvceArray1D<Real> rank_sendbuf_vars_, rank_recvbuf_vars_;
   HostArray1D<int> rank_sendhdr_vars_, rank_recvhdr_vars_;
+  // Device-resident mirrors of the entry tables, used by fused pack/unpack
+  // kernels (one launch per direction per call) instead of N small
+  // Kokkos::deep_copy calls. Rebuilt by BuildRankPackedVarMetadata.
+  DvceArray1D<RankPackedVarEntry> send_var_entries_d_, recv_var_entries_d_;
+  // Cached unpack-task table for the recv-side scatter kernel. Built once in
+  // BuildRankPackedVarMetadata from the headers received from each peer.
+  DvceArray1D<RankPackedVarEntry> unpack_tasks_d_;
+  // Per-(MeshBlock,neighbour) base offsets into the rank-packed aggregate
+  // buffers, dimensioned (nmb*nnghbr). For off-rank neighbours these hold the
+  // entry's offset in rank_{send,recv}buf_vars_; on-rank/non-existent entries
+  // are -1. Built once in BuildRankPackedVarMetadata so the pack/unpack kernels
+  // read/write the aggregate buffer directly (fusing the former
+  // RankPackAgg/RankUnpackScatter kernels into SendBuff/RecvBuff).
+  DvceArray1D<int> send_agg_offset_, recv_agg_offset_;
   void InvalidateRankPackedVarMetadata() { rank_packed_bvals_nvars_ = -1; }
 #endif
 
