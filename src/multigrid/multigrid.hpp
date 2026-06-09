@@ -640,6 +640,16 @@ class MultigridBoundaryValues : public MeshBoundaryValuesCC {
   DvceArray1D<Real> mg_rank_recvbuf_vars_;
   DvceArray1D<int> mg_rank_sendhdr_vars_;
   DvceArray1D<int> mg_rank_recvhdr_vars_;
+  // Per-(MeshBlock,neighbour) base offsets into the rank-packed aggregate
+  // buffers, dimensioned (nmb*nnghbr). For off-rank neighbours these hold the
+  // entry's offset in mg_rank_{send,recv}buf_vars_; on-rank/non-existent/skipped
+  // entries are -1. Built in BuildRankPackedMGMetadata so PackMG/UnpackMG can
+  // read/write the aggregate buffer directly (fusing the former MGRankPackAgg /
+  // MGRankUnpackScatter kernels). Send/recv entries are sorted so both ranks of
+  // a pair agree on payload order with no header exchange (recv (m,n) == send
+  // (lid,dn) for the same face exchange).
+  DvceArray1D<int> mg_send_agg_offset_;
+  DvceArray1D<int> mg_recv_agg_offset_;
   // Device-resident mirrors of the entry tables, used by fused pack/unpack kernels
   // to avoid issuing one Kokkos::deep_copy per entry. Rebuilt alongside the buffer
   // allocations in BuildRankPackedMGMetadata.

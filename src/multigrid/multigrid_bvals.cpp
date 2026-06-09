@@ -96,6 +96,25 @@ void MultigridBoundaryValues::BuildRankPackedMGMetadata(const int nvars, const i
     }
   }
 
+  // Deterministic, rank-agnostic payload ordering so the two ranks of a pair
+  // agree on the byte layout WITHOUT exchanging headers. For a given face
+  // exchange, the sender's (lid,dn) == the receiver's (m,n) (same receiving
+  // block + neighbour slot), so sorting sends by (lid,dn) and recvs by (m,n)
+  // produces identical orderings on both sides. This lets the receiver build
+  // its unpack offsets purely locally (see mg_recv_agg_offset_ below).
+  for (auto &kv : send_by_rank) {
+    std::sort(kv.second.begin(), kv.second.end(),
+              [](const RankPackedVarEntry &a, const RankPackedVarEntry &b) {
+                return (a.lid != b.lid) ? (a.lid < b.lid) : (a.dn < b.dn);
+              });
+  }
+  for (auto &kv : recv_by_rank) {
+    std::sort(kv.second.begin(), kv.second.end(),
+              [](const RankPackedVarEntry &a, const RankPackedVarEntry &b) {
+                return (a.m != b.m) ? (a.m < b.m) : (a.n < b.n);
+              });
+  }
+
   int send_data_off = 0;
   int send_entry_off = 0;
   int send_hdr_off = 0;
@@ -160,6 +179,29 @@ void MultigridBoundaryValues::BuildRankPackedMGMetadata(const int nvars, const i
     Kokkos::deep_copy(mg_send_var_entries_d_, h_send);
     Kokkos::deep_copy(mg_recv_var_entries_d_, h_recv);
   }
+
+  // Per-(m,n) base offsets into the aggregate buffers. -1 == on-rank / no
+  // neighbour / skipped. The pack/unpack kernels use these to read/write the
+  // aggregate buffer directly, so no companion gather/scatter kernel is needed.
+  // Recv offsets come straight from this rank's own sorted recv entries (no
+  // header needed): the sort guarantees they match the sender's layout.
+  {
+    const int map_len = nmb*nnghbr;
+    mg_send_agg_offset_ = DvceArray1D<int>("mg_send_agg_offset", std::max(1, map_len));
+    mg_recv_agg_offset_ = DvceArray1D<int>("mg_recv_agg_offset", std::max(1, map_len));
+    auto send_off_h = Kokkos::create_mirror_view(mg_send_agg_offset_);
+    auto recv_off_h = Kokkos::create_mirror_view(mg_recv_agg_offset_);
+    for (int i = 0; i < std::max(1, map_len); ++i) { send_off_h(i) = -1; recv_off_h(i) = -1; }
+    for (const auto &e : mg_send_var_entries_) {
+      send_off_h(e.m*nnghbr + e.n) = e.offset;
+    }
+    for (const auto &e : mg_recv_var_entries_) {
+      recv_off_h(e.m*nnghbr + e.n) = e.offset;
+    }
+    Kokkos::deep_copy(mg_send_agg_offset_, send_off_h);
+    Kokkos::deep_copy(mg_recv_agg_offset_, recv_off_h);
+  }
+
   mg_send_var_reqs_.assign(mg_send_var_msgs_.size(), MPI_REQUEST_NULL);
   mg_recv_var_reqs_.assign(mg_recv_var_msgs_.size(), MPI_REQUEST_NULL);
   mg_send_var_hdr_reqs_.assign(mg_send_var_msgs_.size(), MPI_REQUEST_NULL);
@@ -2163,11 +2205,15 @@ TaskStatus MultigridBoundaryValues::PackAndSendMG(const DvceArray5D<Real> &u) {
   bool skip_fc_this_level = (ncells_ps < 2);
   auto &smgi = send_mg_indcs_;
   auto cbuf = coarse_buf_;
+  // Fused-pack state: when rank-packed, PackMG writes off-rank payloads straight
+  // into the aggregate send buffer at the per-(m,n) base offset.
+  const bool urp = use_rank_packed_mg_bvals_;
+  auto aggsbuf = mg_rank_sendbuf_vars_;
+  auto soff = mg_send_agg_offset_;
 
 #if MPI_PARALLEL_ENABLED
   if (use_rank_packed_mg_bvals_) {
-    for (std::size_t i = 0; i < mg_send_var_msgs_.size(); ++i) {
-      MPI_Wait(&mg_send_var_hdr_reqs_[i], MPI_STATUS_IGNORE);
+    for (std::size_t i = 0; i < mg_send_var_reqs_.size(); ++i) {
       MPI_Wait(&mg_send_var_reqs_[i], MPI_STATUS_IGNORE);
     }
   } else {
@@ -2251,8 +2297,12 @@ TaskStatus MultigridBoundaryValues::PackAndSendMG(const DvceArray5D<Real> &u) {
         } else {
           Kokkos::parallel_for(Kokkos::ThreadVectorRange(tmember, il, iu + 1),
           [&](const int i) {
-            sbuf[n].vars(m, (i-il + ni*(j-jl + nj*(k-kl + nk*v))))
-                = cbuf(m, v, k, j, i);
+            const int bi = (i-il + ni*(j-jl + nj*(k-kl + nk*v)));
+            if (urp) {
+              aggsbuf(soff(m*nnghbr + n) + bi) = cbuf(m, v, k, j, i);
+            } else {
+              sbuf[n].vars(m, bi) = cbuf(m, v, k, j, i);
+            }
           });
         }
       });
@@ -2272,8 +2322,12 @@ TaskStatus MultigridBoundaryValues::PackAndSendMG(const DvceArray5D<Real> &u) {
         } else {
           Kokkos::parallel_for(Kokkos::ThreadVectorRange(tmember, il, iu + 1),
           [&](const int i) {
-            sbuf[n].vars(m, (i-il + ni*(j-jl + nj*(k-kl + nk*v))))
-                = u(m, v, k, j, i);
+            const int bi = (i-il + ni*(j-jl + nj*(k-kl + nk*v)));
+            if (urp) {
+              aggsbuf(soff(m*nnghbr + n) + bi) = u(m, v, k, j, i);
+            } else {
+              sbuf[n].vars(m, bi) = u(m, v, k, j, i);
+            }
           });
         }
       });
@@ -2299,51 +2353,21 @@ TaskStatus MultigridBoundaryValues::PackAndSendMG(const DvceArray5D<Real> &u) {
 
   bool no_errors = true;
   if (use_rank_packed_mg_bvals_) {
-    // Fused device-side aggregate: one TeamPolicy kernel copies every entry from
-    // its per-neighbour pack buffer into the rank-packed aggregate buffer. Replaces
-    // an O(n_entries) sequence of Kokkos::deep_copy calls (each a separate kernel
-    // launch) with a single launch, which is the dominant cost at high node count.
-    const int n_send_entries = static_cast<int>(mg_send_var_entries_.size());
-    if (n_send_entries > 0) {
-      auto entries = mg_send_var_entries_d_;
-      auto aggbuf = mg_rank_sendbuf_vars_;
-      Kokkos::TeamPolicy<> agg_policy(DevExeSpace(), n_send_entries, Kokkos::AUTO);
-      Kokkos::parallel_for("MGRankPackAgg", agg_policy,
-        KOKKOS_LAMBDA(TeamMember_t tm) {
-          const int e = tm.league_rank();
-          const auto entry = entries(e);
-          Kokkos::parallel_for(Kokkos::TeamVectorRange(tm, entry.data_size),
-            [&](const int k) {
-              aggbuf(entry.offset + k) = sbuf[entry.n].vars(entry.m, k);
-            });
-        });
-    }
-    auto send_hdr_h = Kokkos::create_mirror_view(mg_rank_sendhdr_vars_);
-    for (const auto &msg : mg_send_var_msgs_) {
-      for (int e = 0; e < msg.nentries; ++e) {
-        const auto &entry = mg_send_var_entries_[msg.entry_offset + e];
-        const int hdr_i = msg.hdr_offset + 3 * e;
-        send_hdr_h(hdr_i + 0) = entry.lid;
-        send_hdr_h(hdr_i + 1) = entry.dn;
-        send_hdr_h(hdr_i + 2) = entry.data_size;
-      }
-    }
-    Kokkos::deep_copy(mg_rank_sendhdr_vars_, send_hdr_h);
-    Kokkos::fence();
-
+    // PackMG already wrote every off-rank payload directly into
+    // mg_rank_sendbuf_vars_ at its per-(m,n) base offset, so the only device
+    // work left before MPI is the fence above. No separate aggregate kernel and
+    // no header message: the receiver derives the payload layout from its own
+    // sorted recv entries (see BuildRankPackedMGMetadata).
     for (std::size_t i = 0; i < mg_send_var_msgs_.size(); ++i) {
       const auto &msg = mg_send_var_msgs_[i];
-      int ierr_h = MPI_Isend(mg_rank_sendhdr_vars_.data() + msg.hdr_offset, 3 * msg.nentries,
-                             MPI_INT, msg.rank, 96, comm_vars, &mg_send_var_hdr_reqs_[i]);
       int ierr_d = MPI_Isend(mg_rank_sendbuf_vars_.data() + msg.offset, msg.data_size,
                              MPI_ATHENA_REAL, msg.rank, 97, comm_vars, &mg_send_var_reqs_[i]);
-      if (ierr_h != MPI_SUCCESS || ierr_d != MPI_SUCCESS) {
+      if (ierr_d != MPI_SUCCESS) {
         no_errors = false;
       } else {
-        pmy_mg->pmy_driver_->mg_timers_.msg_count += 2;
+        pmy_mg->pmy_driver_->mg_timers_.msg_count += 1;
         pmy_mg->pmy_driver_->mg_timers_.bytes_sent +=
-            (msg.data_size * static_cast<int64_t>(sizeof(Real))
-             + 3LL * msg.nentries * static_cast<int64_t>(sizeof(int)));
+            (msg.data_size * static_cast<int64_t>(sizeof(Real)));
       }
     }
   } else {
@@ -2417,17 +2441,15 @@ TaskStatus MultigridBoundaryValues::RecvAndUnpackMG(DvceArray5D<Real> &u) {
   bool bflag = false;
   if (use_rank_packed_mg_bvals_) {
     for (std::size_t i = 0; i < mg_recv_var_msgs_.size(); ++i) {
-      int test_h = 0;
       int test_d = 0;
-      int ierr_h = MPI_Test(&mg_recv_var_hdr_reqs_[i], &test_h, MPI_STATUS_IGNORE);
       int ierr_d = MPI_Test(&mg_recv_var_reqs_[i], &test_d, MPI_STATUS_IGNORE);
-      if (ierr_h != MPI_SUCCESS || ierr_d != MPI_SUCCESS) {
+      if (ierr_d != MPI_SUCCESS) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
                   << std::endl << "MPI error in testing rank-packed MG receives"
                   << std::endl;
         std::exit(EXIT_FAILURE);
       }
-      if (!(static_cast<bool>(test_h) && static_cast<bool>(test_d))) {
+      if (!(static_cast<bool>(test_d))) {
         bflag = true;
       }
     }
@@ -2461,82 +2483,18 @@ TaskStatus MultigridBoundaryValues::RecvAndUnpackMG(DvceArray5D<Real> &u) {
   }
 #endif
 
-#if MPI_PARALLEL_ENABLED
-  if (use_rank_packed_mg_bvals_) {
-    // Fused device-side scatter: build a small per-entry task table on host from
-    // the received header, deep_copy it once, then run one parallel_for that
-    // distributes every entry from the rank-packed recv buffer into the
-    // per-neighbour recv buffers. Replaces O(n_entries) Kokkos::deep_copy
-    // launches with a single launch.
-    auto recv_hdr_h = Kokkos::create_mirror_view_and_copy(HostMemSpace(), mg_rank_recvhdr_vars_);
-    const int n_recv_entries = static_cast<int>(mg_recv_var_entries_.size());
-    if (n_recv_entries > 0) {
-      auto unpack_tasks_d =
-          DvceArray1D<RankPackedVarEntry>("mg_unpack_tasks", n_recv_entries);
-      auto unpack_tasks_h = Kokkos::create_mirror_view(unpack_tasks_d);
-      int t = 0;
-      for (const auto &msg : mg_recv_var_msgs_) {
-        int off = msg.offset;
-        for (int e = 0; e < msg.nentries; ++e) {
-          const int hdr_i = msg.hdr_offset + 3 * e;
-          const int lid = recv_hdr_h(hdr_i + 0);
-          const int dn = recv_hdr_h(hdr_i + 1);
-          const int dsize = recv_hdr_h(hdr_i + 2);
-          if (lid < 0 || lid >= nmb || dn < 0 || dn >= nnghbr) {
-            std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                      << std::endl << "Invalid rank-packed MG recv header metadata"
-                      << std::endl;
-            std::exit(EXIT_FAILURE);
-          }
-          if (dsize <= 0 || (off + dsize) > (msg.offset + msg.data_size)) {
-            std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                      << std::endl << "Rank-packed MG recv payload size mismatch"
-                      << std::endl;
-            std::exit(EXIT_FAILURE);
-          }
-          // Repurpose RankPackedVarEntry's fields: lid/dn for destination,
-          // offset for source-aggregate offset, data_size for payload length.
-          // m/n are unused here.
-          unpack_tasks_h(t).m = 0;
-          unpack_tasks_h(t).n = 0;
-          unpack_tasks_h(t).lid = lid;
-          unpack_tasks_h(t).dn = dn;
-          unpack_tasks_h(t).data_size = dsize;
-          unpack_tasks_h(t).offset = off;
-          ++t;
-          off += dsize;
-        }
-        if (off != (msg.offset + msg.data_size)) {
-          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-                    << std::endl << "Rank-packed MG recv payload accounting mismatch"
-                    << std::endl;
-          std::exit(EXIT_FAILURE);
-        }
-      }
-      Kokkos::deep_copy(unpack_tasks_d, unpack_tasks_h);
-
-      auto aggbuf = mg_rank_recvbuf_vars_;
-      Kokkos::TeamPolicy<> sc_policy(DevExeSpace(), n_recv_entries, Kokkos::AUTO);
-      Kokkos::parallel_for("MGRankUnpackScatter", sc_policy,
-        KOKKOS_LAMBDA(TeamMember_t tm) {
-          const int e = tm.league_rank();
-          const auto task = unpack_tasks_d(e);
-          Kokkos::parallel_for(Kokkos::TeamVectorRange(tm, task.data_size),
-            [&](const int k) {
-              rbuf[task.dn].vars(task.lid, k) = aggbuf(task.offset + k);
-            });
-        });
-      Kokkos::fence();
-    }
-  }
-#endif
-
   //----- STEP 2: buffers have all completed, so unpack
+  // Off-rank payloads are read directly out of the rank-packed aggregate recv
+  // buffer (fuses the former MGRankUnpackScatter kernel); on-rank payloads sit
+  // in their per-neighbour recv buffers, written there directly by the sender.
   int nvar = u.extent_int(1);
   int ngh = pmy_mg->GetGhostCells();
   int lev_ = pmy_mg->GetCurrentLevel();
   auto cbuf = coarse_buf_;
   auto &rmgi = recv_mg_indcs_;
+  const bool urp = use_rank_packed_mg_bvals_;
+  auto aggrbuf = mg_rank_recvbuf_vars_;
+  auto roff = mg_recv_agg_offset_;
 
   {
   int nmnv = nmb * nnghbr * nvar;
@@ -2583,6 +2541,10 @@ TaskStatus MultigridBoundaryValues::RecvAndUnpackMG(DvceArray5D<Real> &u) {
     int nk = ku - kl + 1;
     int nkj = nk * nj;
 
+    // base offset of this (m,n) payload in the aggregate recv buffer; -1 means
+    // on-rank (data already sits in rbuf) or legacy (non-rank-packed) path.
+    const int base = urp ? roff(m*nnghbr + n) : -1;
+
     if (from_coarser) {
       Kokkos::parallel_for(Kokkos::TeamThreadRange<>(tmember, nkj),
       [&](const int idx) {
@@ -2591,8 +2553,8 @@ TaskStatus MultigridBoundaryValues::RecvAndUnpackMG(DvceArray5D<Real> &u) {
         k += kl;
         Kokkos::parallel_for(Kokkos::ThreadVectorRange(tmember, il, iu + 1),
         [&](const int i) {
-          cbuf(m, v, k, j, i) = rbuf[n].vars(m,
-              (i-il + ni*(j-jl + nj*(k-kl + nk*v))));
+          const int bi = (i-il + ni*(j-jl + nj*(k-kl + nk*v)));
+          cbuf(m, v, k, j, i) = (base >= 0) ? aggrbuf(base + bi) : rbuf[n].vars(m, bi);
         });
       });
     } else {
@@ -2603,8 +2565,8 @@ TaskStatus MultigridBoundaryValues::RecvAndUnpackMG(DvceArray5D<Real> &u) {
         k += kl;
         Kokkos::parallel_for(Kokkos::ThreadVectorRange(tmember, il, iu + 1),
         [&](const int i) {
-          u(m, v, k, j, i) = rbuf[n].vars(m,
-              (i-il + ni*(j-jl + nj*(k-kl + nk*v))));
+          const int bi = (i-il + ni*(j-jl + nj*(k-kl + nk*v)));
+          u(m, v, k, j, i) = (base >= 0) ? aggrbuf(base + bi) : rbuf[n].vars(m, bi);
         });
       });
     }
@@ -2642,16 +2604,15 @@ TaskStatus MultigridBoundaryValues::InitRecvMG(const int nvars) {
       mg_rankpack_mesh_seq_cache_ = mesh_seq;
     }
 
+    // Payload-only Irecv: the receiver derives the payload layout from its own
+    // sorted recv entries (see BuildRankPackedMGMetadata), so no header is sent.
     for (std::size_t i = 0; i < mg_recv_var_msgs_.size(); ++i) {
       auto &msg = mg_recv_var_msgs_[i];
-      MPI_Wait(&mg_recv_var_hdr_reqs_[i], MPI_STATUS_IGNORE);
       MPI_Wait(&mg_recv_var_reqs_[i], MPI_STATUS_IGNORE);
 
-      int ierr_h = MPI_Irecv(mg_rank_recvhdr_vars_.data() + msg.hdr_offset, 3 * msg.nentries,
-                             MPI_INT, msg.rank, 96, comm_vars, &mg_recv_var_hdr_reqs_[i]);
       int ierr_d = MPI_Irecv(mg_rank_recvbuf_vars_.data() + msg.offset, msg.data_size,
                              MPI_ATHENA_REAL, msg.rank, 97, comm_vars, &mg_recv_var_reqs_[i]);
-      if (ierr_h != MPI_SUCCESS || ierr_d != MPI_SUCCESS) {
+      if (ierr_d != MPI_SUCCESS) {
         std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
            << std::endl << "MPI error in posting rank-packed MG receives" << std::endl;
         std::exit(EXIT_FAILURE);
@@ -2718,7 +2679,6 @@ TaskStatus MultigridBoundaryValues::ClearRecvMG() {
 #if MPI_PARALLEL_ENABLED
   if (use_rank_packed_mg_bvals_) {
     for (std::size_t i = 0; i < mg_recv_var_reqs_.size(); ++i) {
-      MPI_Wait(&mg_recv_var_hdr_reqs_[i], MPI_STATUS_IGNORE);
       MPI_Wait(&mg_recv_var_reqs_[i], MPI_STATUS_IGNORE);
     }
     return TaskStatus::complete;
@@ -2735,7 +2695,6 @@ TaskStatus MultigridBoundaryValues::ClearSendMG() {
 #if MPI_PARALLEL_ENABLED
   if (use_rank_packed_mg_bvals_) {
     for (std::size_t i = 0; i < mg_send_var_reqs_.size(); ++i) {
-      MPI_Wait(&mg_send_var_hdr_reqs_[i], MPI_STATUS_IGNORE);
       MPI_Wait(&mg_send_var_reqs_[i], MPI_STATUS_IGNORE);
     }
     return TaskStatus::complete;
