@@ -662,6 +662,26 @@ class MultigridBoundaryValues : public MeshBoundaryValuesCC {
 
 #if MPI_PARALLEL_ENABLED
   void BuildRankPackedMGMetadata(const int nvars, const int lev, const bool skip_fc);
+  // Per-level cache of rank-packed comm state. The single-slot cache (the
+  // mg_rankpack_*_cache_ ints above) rebuilt metadata on every MG level
+  // transition (~85x/cycle at 1 mb/GPU), each rebuild doing several device
+  // allocations + H2D deep_copies that dominate when the payload is tiny. This
+  // caches each level's state, built once and persisted across the many level
+  // revisits in a V-cycle via write-back on level switch.
+  struct MGRankPackLevelState {
+    bool built = false;
+    int nvars = -1;
+    bool skip_fc = false;
+    std::vector<RankPackedVarMessage> send_msgs, recv_msgs;
+    std::vector<MPI_Request> send_reqs, recv_reqs;
+    DvceArray1D<Real> sendbuf, recvbuf;
+    DvceArray1D<int> send_off, recv_off;
+  };
+  std::vector<MGRankPackLevelState> mg_rp_cache_;
+  int mg_rp_cache_seq_ = -1;     // mesh_seq the cache was built for (AMR invalidation)
+  int mg_rp_active_level_ = -1;  // level whose state currently lives in the bare members
+  void SaveRankPackState(MGRankPackLevelState &s);
+  void LoadRankPackState(const MGRankPackLevelState &s);
 #endif
 };
 

@@ -2577,6 +2577,36 @@ TaskStatus MultigridBoundaryValues::RecvAndUnpackMG(DvceArray5D<Real> &u) {
   return TaskStatus::complete;
 }
 
+#if MPI_PARALLEL_ENABLED
+//----------------------------------------------------------------------------------------
+//! Save/Load the active rank-packed comm state to/from a per-level cache slot.
+//! Views are ref-counted (O(1), no data copy); the vectors are small. The MPI
+//! request vectors are saved/loaded so each level's in-flight sends stay paired
+//! with that level's buffer across level transitions.
+
+void MultigridBoundaryValues::SaveRankPackState(MGRankPackLevelState &s) {
+  s.send_msgs = mg_send_var_msgs_;
+  s.recv_msgs = mg_recv_var_msgs_;
+  s.send_reqs = mg_send_var_reqs_;
+  s.recv_reqs = mg_recv_var_reqs_;
+  s.sendbuf   = mg_rank_sendbuf_vars_;
+  s.recvbuf   = mg_rank_recvbuf_vars_;
+  s.send_off  = mg_send_agg_offset_;
+  s.recv_off  = mg_recv_agg_offset_;
+}
+
+void MultigridBoundaryValues::LoadRankPackState(const MGRankPackLevelState &s) {
+  mg_send_var_msgs_     = s.send_msgs;
+  mg_recv_var_msgs_     = s.recv_msgs;
+  mg_send_var_reqs_     = s.send_reqs;
+  mg_recv_var_reqs_     = s.recv_reqs;
+  mg_rank_sendbuf_vars_ = s.sendbuf;
+  mg_rank_recvbuf_vars_ = s.recvbuf;
+  mg_send_agg_offset_   = s.send_off;
+  mg_recv_agg_offset_   = s.recv_off;
+}
+#endif
+
 //----------------------------------------------------------------------------------------
 //! \fn  void MeshBoundaryValues::InitRecv
 //! \brief Posts non-blocking receives (with MPI) for boundary communications of vars.
@@ -2594,14 +2624,39 @@ TaskStatus MultigridBoundaryValues::InitRecvMG(const int nvars) {
   const int mesh_seq = pmy_pack->pmesh->GetAMRLoadBalanceUpdateSeq();
 
   if (use_rank_packed_mg_bvals_) {
-    if (mg_rankpack_nvars_cache_ != nvars || mg_rankpack_level_cache_ != lev_
-        || mg_rankpack_skipfc_cache_ != skip_fc_ir
-        || mg_rankpack_mesh_seq_cache_ != mesh_seq) {
+    // Per-level metadata cache (see header). The V-cycle revisits each level
+    // ~12x/cycle; building metadata each time meant ~85 rebuilds/cycle, each
+    // doing several device allocations + H2D deep_copies that dominate at small
+    // payloads. Build each level once and persist it; write the active level's
+    // state back before switching so its in-flight requests + buffers stay paired.
+    if (static_cast<int>(mg_rp_cache_.size()) < kMaxMGLevels) {
+      mg_rp_cache_.resize(kMaxMGLevels);
+    }
+    if (mg_rp_cache_seq_ != mesh_seq) {            // AMR/regrid: invalidate all levels
+      for (auto &s : mg_rp_cache_) s = MGRankPackLevelState();
+      mg_rp_cache_seq_ = mesh_seq;
+      mg_rp_active_level_ = -1;
+    }
+    if (lev_ >= 0 && lev_ < kMaxMGLevels) {
+      auto &c = mg_rp_cache_[lev_];
+      const bool key_ok = c.built && c.nvars == nvars && c.skip_fc == skip_fc_ir;
+      if (lev_ != mg_rp_active_level_ || !key_ok) {
+        if (mg_rp_active_level_ >= 0 && mg_rp_active_level_ != lev_) {
+          SaveRankPackState(mg_rp_cache_[mg_rp_active_level_]);
+        }
+        if (!key_ok) {
+          BuildRankPackedMGMetadata(nvars, lev_, skip_fc_ir);
+          SaveRankPackState(c);
+          c.built = true; c.nvars = nvars; c.skip_fc = skip_fc_ir;
+        } else {
+          LoadRankPackState(c);
+        }
+        mg_rp_active_level_ = lev_;
+      }
+    } else {
+      // out-of-range level (should not happen): rebuild bare each call
       BuildRankPackedMGMetadata(nvars, lev_, skip_fc_ir);
-      mg_rankpack_nvars_cache_ = nvars;
-      mg_rankpack_level_cache_ = lev_;
-      mg_rankpack_skipfc_cache_ = skip_fc_ir;
-      mg_rankpack_mesh_seq_cache_ = mesh_seq;
+      mg_rp_active_level_ = -1;
     }
 
     // Payload-only Irecv: the receiver derives the payload layout from its own
