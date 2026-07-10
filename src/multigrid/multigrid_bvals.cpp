@@ -41,6 +41,15 @@ MultigridBoundaryValues::MultigridBoundaryValues(
       pin->GetOrAddBoolean("gravity", "show_rank_packed_mg_bvals_stats", false);
 }
 
+//----------------------------------------------------------------------------------------
+//! \fn MultigridBoundaryValues::~MultigridBoundaryValues()
+//! \brief Destructor for multigrid boundary values object. Provides the out-of-line
+//! anchor (key function) so the vtable is emitted now that the base MeshBoundaryValues
+//! destructor is virtual.
+
+MultigridBoundaryValues::~MultigridBoundaryValues() {
+}
+
 #if MPI_PARALLEL_ENABLED
 void MultigridBoundaryValues::BuildRankPackedMGMetadata(const int nvars, const int lev,
                                                         const bool skip_fc) {
