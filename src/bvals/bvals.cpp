@@ -30,8 +30,6 @@ MeshBoundaryValues::MeshBoundaryValues(MeshBlockPack *pp, ParameterInput *pin, b
   i_in("iin",1,1)
 #if MPI_PARALLEL_ENABLED
   ,
-  show_rank_packed_bvals_stats_(pin->GetOrAddBoolean("mesh",
-                                    "show_rank_packed_bvals_stats", false)),
   rank_packed_bvals_nvars_(-1),
   rank_sendbuf_vars_("rank_sendbuf_vars",1),
   rank_recvbuf_vars_("rank_recvbuf_vars",1),
@@ -339,15 +337,6 @@ void MeshBoundaryValues::BuildRankPackedVarMetadata(const int nvars) {
     }
     Kokkos::deep_copy(recv_agg_offset_, recv_off_h);
     Kokkos::deep_copy(send_agg_offset_, send_off_h);
-  }
-
-  if (show_rank_packed_bvals_stats_) {
-    std::cout << "[rank " << global_variable::my_rank << "] rank-packed bvals vars: "
-              << "legacy_send_msgs=" << send_var_entries_.size()
-              << " packed_send_msgs=" << send_var_msgs_.size()
-              << " legacy_recv_msgs=" << recv_var_entries_.size()
-              << " packed_recv_msgs=" << recv_var_msgs_.size()
-              << std::endl;
   }
 }
 #endif

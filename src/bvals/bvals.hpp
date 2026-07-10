@@ -155,7 +155,6 @@ class MeshBoundaryValues {
   MPI_Comm comm_vars, comm_flux;
 
   // rank-packed vars communication path
-  bool show_rank_packed_bvals_stats_;
   int rank_packed_bvals_nvars_;
   int rank_packed_mesh_seq_;
   std::vector<RankPackedVarEntry> send_var_entries_, recv_var_entries_;

@@ -624,8 +624,6 @@ class MultigridBoundaryValues : public MeshBoundaryValuesCC {
 
  private:
   Multigrid *pmy_mg;
-  bool use_rank_packed_mg_bvals_ = false;
-  bool show_rank_packed_mg_bvals_stats_ = false;
   std::vector<RankPackedVarEntry> mg_send_var_entries_;
   std::vector<RankPackedVarEntry> mg_recv_var_entries_;
   std::vector<RankPackedVarMessage> mg_send_var_msgs_;
