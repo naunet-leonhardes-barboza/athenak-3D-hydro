@@ -192,8 +192,10 @@ void MultigridDriver::PrepareForAMR() {
     needinit_ = true;
   }
 
-  if (pmy_mesh_->IsMeshUpdated()) {
+  const int mesh_seq = pmy_mesh_->GetAMRLoadBalanceUpdateSeq();
+  if (amr_seq_ != mesh_seq) {
     needinit_ = true;
+    amr_seq_ = mesh_seq;
   }
 
   // Calculate number of refinement levels present in mesh
@@ -2297,7 +2299,7 @@ void MultigridDriver::CalculateMultipoleCoefficients() {
     }
   }
 
-#ifdef MPI_PARALLEL
+#if MPI_PARALLEL_ENABLED
   MPI_Allreduce(MPI_IN_PLACE, mpcoeff_, nmpcoeff_, MPI_ATHENA_REAL,
                 MPI_SUM, MPI_COMM_WORLD);
 #endif
@@ -2413,7 +2415,7 @@ void MultigridDriver::CalculateCenterOfMass() {
     }
   }
 
-#ifdef MPI_PARALLEL
+#if MPI_PARALLEL_ENABLED
   MPI_Allreduce(MPI_IN_PLACE, totals, 4, MPI_ATHENA_REAL,
                 MPI_SUM, MPI_COMM_WORLD);
 #endif
