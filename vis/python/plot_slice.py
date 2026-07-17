@@ -1728,7 +1728,7 @@ def cks_to_sks_vec_cov(a_x, a_y, a_z, a, x, y, z):
     return a_r, a_th, a_ph
 
 
-# Function for converting 3-magnetic field to 4-magnetic field
+# function for converting 3-magnetic field to 4-magnetic field
 def three_field_to_four_field(bbx, bby, bbz, ut, ux, uy, uz, u_x, u_y, u_z):
     bt = u_x * bbx + u_y * bby + u_z * bbz
     bx = (bbx + bt * ux) / ut
@@ -1737,7 +1737,7 @@ def three_field_to_four_field(bbx, bby, bbz, ut, ux, uy, uz, u_x, u_y, u_z):
     return bt, bx, by, bz
 
 
-# Function for converting contravariant rank-2 tensor CKS components to SKS
+# function for converting contravariant rank-2 tensor CKS components to SKS
 def cks_to_sks_tens_con(axx, axy, axz, ayx, ayy, ayz, azx, azy, azz, a, x, y, z):
     axr, axth, axph = cks_to_sks_vec_con(axx, axy, axz, a, x, y, z)
     ayr, ayth, ayph = cks_to_sks_vec_con(ayx, ayy, ayz, a, x, y, z)

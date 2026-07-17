@@ -91,9 +91,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       w0_(m,IEN,k,j,i) = pres/gm1;
     });
 
-  // Convert primitives to conserved
+  // convert primitives to conserved
   pmbp->phydro->peos->PrimToCons(w0_, pmbp->phydro->u0, is, ie, js, je, ks, ke);  
   }  
 }
 
- 
