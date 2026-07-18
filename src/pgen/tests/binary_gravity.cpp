@@ -46,7 +46,7 @@ void BinaryGravityErrors(ParameterInput *pin, Mesh *pm);
 //----------------------------------------------------------------------------------------
 //! \fn void ProblemGenerator::BinaryGravity()
 //  \brief Problem generator for binary potential test (two spheres, multigrid gravity)
-void ProblemGenerator::BinaryGravity(ParameterInput *pin, const bool restart) {
+void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   pgen_final_func = BinaryGravityErrors;
   if (restart) return;
 
